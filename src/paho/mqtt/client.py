@@ -81,11 +81,18 @@ if platform.system() == 'Windows':
 else:
     EAGAIN = errno.EAGAIN
 
-# Python 2.7 does not have BlockingIOError.  Fall back to IOError
 try:
     BlockingIOError
 except NameError:
-    BlockingIOError  = IOError
+    # Python 2.7 does not have BlockingIOError.
+    class BlockingIOError(IOError):
+        pass
+
+try:
+    ConnectionError
+except NameError:
+    # Python 2.7 does not have ConnectionError. Fall back to socket.error
+    ConnectionError = socket.error
 
 MQTTv31 = 3
 MQTTv311 = 4
@@ -286,6 +293,9 @@ def _socketpair_compat():
     sock1.setblocking(0)
     try:
         sock1.connect(("127.0.0.1", port))
+    except socket.error as err:
+        if err.errno not in (errno.EINPROGRESS, errno.EWOULDBLOCK, EAGAIN):
+            raise
     except BlockingIOError:
         pass
     sock2, address = listensock.accept()
@@ -615,6 +625,7 @@ class Client(object):
         self._registered_write = False
         # No default callbacks
         self._on_log = None
+        self._on_pre_connect = None
         self._on_connect = None
         self._on_connect_fail = None
         self._on_subscribe = None
@@ -643,6 +654,11 @@ class Client(object):
         except ssl.SSLWantWriteError:
             self._call_socket_register_write()
             raise BlockingIOError
+        except socket.error as err:
+            if err.errno == EAGAIN:
+                raise BlockingIOError
+            else:
+                raise
 
     def _sock_send(self, buf):
         try:
@@ -655,6 +671,11 @@ class Client(object):
         except BlockingIOError:
             self._call_socket_register_write()
             raise BlockingIOError
+        except socket.error as err:
+            if err.errno == EAGAIN:
+                self._call_socket_register_write()
+                raise BlockingIOError
+            raise
 
     def _sock_close(self):
         """Close the connection to the server."""
@@ -1159,8 +1180,13 @@ class Client(object):
             rlist = [self._sock, self._sockpairR]
 
         try:
-            socklist = select.select(rlist, wlist, [], timeout)
-        except TypeError:
+            poll = select.poll()
+            for s in wlist:
+                poll.register(s, select.POLLOUT)
+            for s in rlist:
+                poll.register(s, select.POLLIN)
+            poll_result = poll.poll(timeout)
+        except TypeError as e:
             # Socket isn't correct type, in likelihood connection is lost
             return MQTT_ERR_CONN_LOST
         except ValueError:
@@ -1171,6 +1197,13 @@ class Client(object):
             # Note that KeyboardInterrupt, etc. can still terminate since they
             # are not derived from Exception
             return MQTT_ERR_UNKNOWN
+
+        socklist = ([], [])  # rlist, wlist
+        for fd, flags in poll_result:
+            if flags & select.POLLIN:
+                socklist[0].extend(f for f in rlist if f.fileno() == fd)
+            elif flags & select.POLLOUT:
+                socklist[1].extend(f for f in wlist if f.fileno() == fd)
 
         if self._sock in socklist[0] or pending_bytes > 0:
             rc = self.loop_read()
@@ -1186,6 +1219,9 @@ class Client(object):
                 # Read many bytes at once - this allows up to 10000 calls to
                 # publish() inbetween calls to loop().
                 self._sockpairR.recv(10000)
+            except socket.error as err:
+                if err.errno != EAGAIN:
+                    raise
             except BlockingIOError:
                 pass
 
@@ -1752,7 +1788,7 @@ class Client(object):
             if self._state == mqtt_cs_connect_async:
                 try:
                     self.reconnect()
-                except (OSError, WebsocketConnectionError):
+                except (socket.error, OSError, WebsocketConnectionError):
                     self._handle_on_connect_fail()
                     if not retry_first_connection:
                         raise
@@ -1789,7 +1825,7 @@ class Client(object):
                 else:
                     try:
                         self.reconnect()
-                    except (OSError, WebsocketConnectionError):
+                    except (socket.error, OSError, WebsocketConnectionError):
                         self._handle_on_connect_fail()
                         self._easy_log(
                             MQTT_LOG_DEBUG, "Connection failed, retrying")
@@ -2411,7 +2447,7 @@ class Client(object):
                 command = self._sock_recv(1)
             except BlockingIOError:
                 return MQTT_ERR_AGAIN
-            except ConnectionError as err:
+            except (socket.error, ConnectionError) as err:
                 self._easy_log(
                     MQTT_LOG_ERR, 'failed to receive on socket: %s', err)
                 return MQTT_ERR_CONN_LOST
@@ -2430,7 +2466,7 @@ class Client(object):
                     byte = self._sock_recv(1)
                 except BlockingIOError:
                     return MQTT_ERR_AGAIN
-                except ConnectionError as err:
+                except (socket.error, ConnectionError) as err:
                     self._easy_log(
                         MQTT_LOG_ERR, 'failed to receive on socket: %s', err)
                     return MQTT_ERR_CONN_LOST
@@ -2460,7 +2496,7 @@ class Client(object):
                 data = self._sock_recv(self._in_packet['to_process'])
             except BlockingIOError:
                 return MQTT_ERR_AGAIN
-            except ConnectionError as err:
+            except (socket.error, ConnectionError) as err:
                 self._easy_log(
                     MQTT_LOG_ERR, 'failed to receive on socket: %s', err)
                 return MQTT_ERR_CONN_LOST
@@ -2510,7 +2546,7 @@ class Client(object):
             except BlockingIOError:
                 self._out_packet.appendleft(packet)
                 return MQTT_ERR_AGAIN
-            except ConnectionError as err:
+            except (socket.error, ConnectionError) as err:
                 self._out_packet.appendleft(packet)
                 self._easy_log(
                     MQTT_LOG_ERR, 'failed to receive on socket: %s', err)
@@ -3046,6 +3082,9 @@ class Client(object):
         if self._sockpairW is not None:
             try:
                 self._sockpairW.send(sockpair_data)
+            except socket.error as err:
+                if err.errno != EAGAIN:
+                    raise
             except BlockingIOError:
                 pass
 
@@ -3884,7 +3923,7 @@ class WebsocketWrapper(object):
             data = self._socket.recv(wanted_bytes)
 
             if not data:
-                raise ConnectionAbortedError
+                raise socket.error(errno.ECONNABORTED, 0)
             else:
                 self._readbuffer.extend(data)
 
@@ -3972,6 +4011,14 @@ class WebsocketWrapper(object):
                 return result
             else:
                 raise BlockingIOError
+
+        except socket.error as err:
+            if err.errno == errno.ECONNABORTED:
+                self.connected = False
+                return b''
+            else:
+                # no more data
+                raise
 
         except ConnectionError:
             self.connected = False
